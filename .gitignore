@@ -1,0 +1,3 @@
+*.p8
+.DS_Store
+build/

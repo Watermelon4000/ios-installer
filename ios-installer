@@ -1,0 +1,181 @@
+#!/bin/bash
+# ios-installer (iOS Installer) — build an Xcode project and put it on your own iPhone or iPad over Wi-Fi, then open it.
+# No cable, no tunnel, no QR code, no TestFlight: Apple's own `devicectl` talks to any device that has been
+# paired with this Mac once, as long as it is on the same network and unlocked.
+#
+# Usage:
+#   ios-installer                     build the project in this folder, install on the first available device
+#   ios-installer --device "iPhone"   pick a device by (part of) its name
+#   ios-installer --app path/X.app    skip the build, install a device build you already have
+#   ios-installer --list              show paired devices and whether they can be reached
+#   ios-installer --help
+#
+# Signing: Xcode's own account if one is signed in. Or an App Store Connect API key (Admin role), which lets
+# xcodebuild create the development profile without ever opening Xcode — set ASC_KEY_ID, ASC_ISSUER_ID and
+# optionally ASC_KEY_PATH (default ~/.appstoreconnect/private_keys/AuthKey_<ID>.p8), in the environment or in
+# ~/.config/ios-installer/config (shell syntax, sourced).
+set -euo pipefail
+
+VERSION="0.2.0"
+CONFIG="${IOS_INSTALLER_CONFIG:-$HOME/.config/ios-installer/config}"
+[ -f "$CONFIG" ] || [ ! -f "$HOME/.config/ios-wifi-install/config" ] || CONFIG="$HOME/.config/ios-wifi-install/config"   # its name until 0.2
+
+PROJECT="" WORKSPACE="" SCHEME="" CONFIGURATION="Debug" DEVICE_QUERY="" APP_PATH="" LAUNCH=1 LIST=0 WAIT_LOCKED=120
+
+say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+Options:
+  --project PATH        .xcodeproj to build (default: the one in this folder; project.yml runs xcodegen first)
+  --workspace PATH      .xcworkspace to build instead (CocoaPods and the like)
+  --scheme NAME         scheme (default: the project's name)
+  --configuration NAME  Debug (default) or Release
+  --device NAME         device name, or part of it, or its identifier
+  --app PATH            install this device .app, skip the build
+  --no-launch           install only, do not open the app
+  --wait SECONDS        how long to wait for a locked device to be unlocked (default 120)
+  --list                list paired devices and exit
+  --version
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) PROJECT="$2"; shift 2 ;;
+    --workspace) WORKSPACE="$2"; shift 2 ;;
+    --scheme) SCHEME="$2"; shift 2 ;;
+    --configuration) CONFIGURATION="$2"; shift 2 ;;
+    --device) DEVICE_QUERY="$2"; shift 2 ;;
+    --app) APP_PATH="$2"; shift 2 ;;
+    --no-launch) LAUNCH=0; shift ;;
+    --wait) WAIT_LOCKED="$2"; shift 2 ;;
+    --list) LIST=1; shift ;;
+    --version) echo "ios-installer $VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option $1 (see --help)" ;;
+  esac
+done
+
+command -v xcrun >/dev/null || die "Xcode command-line tools are needed (xcode-select --install)"
+xcrun --find devicectl >/dev/null 2>&1 || die "devicectl not found: it ships with Xcode 15 or later"
+
+# ---------------------------------------------------------------- devices
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Paired iPhones / iPads as "identifier<TAB>name<TAB>type<TAB>reachable", read from devicectl's JSON.
+devices() {
+  xcrun devicectl list devices --json-output "$TMP/devices.json" >/dev/null 2>&1 || die "devicectl could not list devices"
+  /usr/bin/python3 - "$TMP/devices.json" <<'PY'
+import json, sys
+for d in json.load(open(sys.argv[1]))["result"]["devices"]:
+    hw, conn, props = d.get("hardwareProperties", {}), d.get("connectionProperties", {}), d.get("deviceProperties", {})
+    if hw.get("platform") not in ("iOS", "iPadOS") and hw.get("deviceType") not in ("iPhone", "iPad"):
+        continue
+    if conn.get("pairingState") != "paired":
+        continue
+    reachable = "yes" if conn.get("tunnelState") != "unavailable" else "no"
+    print("\t".join([d["identifier"], props.get("name", "?"), hw.get("deviceType", "?"), reachable]))
+PY
+}
+
+if [ "$LIST" = 1 ]; then
+  printf '%-38s %-24s %-8s %s\n' IDENTIFIER NAME TYPE REACHABLE
+  devices | while IFS=$'\t' read -r id name type ok; do printf '%-38s %-24s %-8s %s\n' "$id" "$name" "$type" "$ok"; done
+  exit 0
+fi
+
+# ---------------------------------------------------------------- signing
+
+[ -f "$CONFIG" ] && . "$CONFIG"
+AUTH=()
+if [ -n "${ASC_KEY_ID:-}" ]; then
+  [ -n "${ASC_ISSUER_ID:-}" ] || die "ASC_KEY_ID is set but ASC_ISSUER_ID is not"
+  ASC_KEY_PATH="${ASC_KEY_PATH:-$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8}"
+  [ -f "$ASC_KEY_PATH" ] || die "API key file not found: $ASC_KEY_PATH"
+  AUTH=(-authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+fi
+
+# ---------------------------------------------------------------- build
+
+if [ -z "$APP_PATH" ]; then
+  if [ -z "$PROJECT" ] && [ -z "$WORKSPACE" ]; then
+    if [ -f project.yml ]; then
+      command -v xcodegen >/dev/null || die "project.yml found but xcodegen is not installed (brew install xcodegen)"
+      say "Generating the Xcode project (xcodegen)"
+      xcodegen generate --quiet
+    fi
+    WORKSPACE="$(ls -d ./*.xcworkspace 2>/dev/null | head -1 || true)"
+    [ -z "$WORKSPACE" ] && PROJECT="$(ls -d ./*.xcodeproj 2>/dev/null | head -1 || true)"
+    [ -n "$WORKSPACE$PROJECT" ] || die "no .xcodeproj or .xcworkspace here (use --project or --app)"
+  fi
+  CONTAINER="${WORKSPACE:-$PROJECT}"
+  if [ -z "$SCHEME" ]; then SCHEME="$(basename "$CONTAINER")"; SCHEME="${SCHEME%.xcodeproj}"; SCHEME="${SCHEME%.xcworkspace}"; fi
+  KIND=(-project "$PROJECT"); [ -n "$WORKSPACE" ] && KIND=(-workspace "$WORKSPACE")
+  DERIVED="${IOS_INSTALLER_DERIVED:-./build/ios-installer}"
+
+  say "Building $SCHEME ($CONFIGURATION) for devices"
+  [ ${#AUTH[@]} -gt 0 ] && note "signing through App Store Connect API key $ASC_KEY_ID"
+  if ! xcodebuild "${KIND[@]}" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+      -destination 'generic/platform=iOS' -derivedDataPath "$DERIVED" \
+      -allowProvisioningUpdates ${AUTH[@]+"${AUTH[@]}"} -quiet build > "$TMP/build.log" 2>&1; then
+    grep -E "error:" "$TMP/build.log" | head -20 >&2 || tail -30 "$TMP/build.log" >&2
+    if grep -q "No Accounts\|No profiles for" "$TMP/build.log"; then
+      echo >&2
+      echo "Signing failed: sign in to Xcode (Settings → Accounts), or set an App Store Connect API key" >&2
+      echo "(Admin role) in $CONFIG — see --help." >&2
+    fi
+    exit 1
+  fi
+  APP_PATH="$(ls -d "$DERIVED/Build/Products/$CONFIGURATION-iphoneos/"*.app 2>/dev/null | head -1 || true)"
+  [ -n "$APP_PATH" ] || die "build finished but no .app was found under $DERIVED"
+fi
+
+case "$APP_PATH" in *iphonesimulator*) die "$APP_PATH is a Simulator build; it cannot run on a device" ;; esac
+[ -d "$APP_PATH" ] || die "not an app bundle: $APP_PATH"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null)" \
+  || die "no CFBundleIdentifier in $APP_PATH/Info.plist"
+
+# ---------------------------------------------------------------- device
+
+say "Finding the device"
+LINE="$(devices | awk -F'\t' -v q="$DEVICE_QUERY" '
+  $4 == "yes" && (q == "" || index(tolower($2), tolower(q)) || $1 == q) { print; exit }')"
+if [ -z "$LINE" ]; then
+  echo "No reachable paired device${DEVICE_QUERY:+ matching \"$DEVICE_QUERY\"}." >&2
+  echo "The device must be on the same Wi-Fi as this Mac, unlocked, and paired once before (connect it by" >&2
+  echo "cable once and trust this Mac; with Developer Mode on). Paired devices:" >&2
+  devices | awk -F'\t' '{ printf "    %s  %s (%s)  reachable: %s\n", $1, $2, $3, $4 }' >&2
+  exit 1
+fi
+DEVICE_ID="$(cut -f1 <<<"$LINE")"
+note "$(cut -f2 <<<"$LINE") ($DEVICE_ID)"
+
+# ---------------------------------------------------------------- install
+
+say "Installing $BUNDLE_ID"
+waited=0
+until xcrun devicectl device install app --device "$DEVICE_ID" "$APP_PATH" > "$TMP/install.log" 2>&1; do
+  if grep -qi "DeviceLocked\|device is locked" "$TMP/install.log" && [ "$waited" -lt "$WAIT_LOCKED" ]; then
+    [ "$waited" = 0 ] && note "the device is locked: unlock it (waiting up to ${WAIT_LOCKED}s)"
+    sleep 5; waited=$((waited + 5))
+    continue
+  fi
+  grep -iE "error|failed|reason" "$TMP/install.log" | head -12 >&2 || tail -20 "$TMP/install.log" >&2
+  if grep -qi "provision\|not been explicitly trusted\|ApplicationVerificationFailed" "$TMP/install.log"; then
+    echo >&2
+    echo "The device refused the app's signature: is it registered on the team's provisioning profile," >&2
+    echo "and (for a personal team) is the developer trusted in Settings → General → VPN & Device Management?" >&2
+  fi
+  exit 1
+done
+
+if [ "$LAUNCH" = 1 ]; then
+  say "Opening"
+  xcrun devicectl device process launch --device "$DEVICE_ID" "$BUNDLE_ID" > "$TMP/launch.log" 2>&1 \
+    || { note "installed, but could not open it (is the device locked?):"; tail -3 "$TMP/launch.log" | sed 's/^/    /'; exit 0; }
+fi
+say "Done"
